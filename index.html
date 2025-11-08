@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>我的笔记</title>
+    <title>我的笔记 - IndexedDB版</title>
     <style>
         * {
             margin: 0;
@@ -668,6 +668,17 @@
                 height: 70px;
             }
         }
+
+        /* 存储信息提示 */
+        .storage-info {
+            font-size: 11px;
+            color: var(--text-light);
+            text-align: center;
+            margin-top: 10px;
+            padding: 8px;
+            background: rgba(var(--theme-color-rgb), 0.05);
+            border-radius: 8px;
+        }
     </style>
 </head>
 <body data-theme="blue">
@@ -766,7 +777,8 @@
 
                 <div class="settings-section">
                     <div class="settings-title">数据管理</div>
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="app.manualSave()">💾 手动保存所有数据</button>
+                    <div class="storage-info" id="storageInfo">正在计算存储空间...</div>
+                    <button class="btn" style="width: 100%; margin-top: 10px; margin-bottom: 10px;" onclick="app.manualSave()">💾 手动保存所有数据</button>
                     <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="app.showExportModal()">📤 导出数据</button>
                     <input type="file" id="importInput" class="file-input" accept=".json" onchange="app.importData(this)">
                     <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('importInput').click()">📥 导入数据</button>
@@ -846,6 +858,118 @@
     </div>
 
     <script>
+        // IndexedDB 数据库管理
+        class NotesDB {
+            constructor() {
+                this.dbName = 'NotesAppDB';
+                this.version = 1;
+                this.db = null;
+            }
+
+            async init() {
+                return new Promise((resolve, reject) => {
+                    const request = indexedDB.open(this.dbName, this.version);
+                    
+                    request.onerror = () => reject(request.error);
+                    request.onsuccess = () => {
+                        this.db = request.result;
+                        resolve();
+                    };
+                    
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        if (!db.objectStoreNames.contains('appData')) {
+                            db.createObjectStore('appData', { keyPath: 'id' });
+                        }
+                    };
+                });
+            }
+
+            async saveData(key, value) {
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['appData'], 'readwrite');
+                    const store = transaction.objectStore('appData');
+                    const request = store.put({ id: key, value: value });
+                    
+                    request.onsuccess = () => resolve();
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async getData(key) {
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['appData'], 'readonly');
+                    const store = transaction.objectStore('appData');
+                    const request = store.get(key);
+                    
+                    request.onsuccess = () => resolve(request.result?.value);
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async clearAll() {
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['appData'], 'readwrite');
+                    const store = transaction.objectStore('appData');
+                    const request = store.clear();
+                    
+                    request.onsuccess = () => resolve();
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async estimateStorage() {
+                if (navigator.storage && navigator.storage.estimate) {
+                    return await navigator.storage.estimate();
+                }
+                return { usage: 0, quota: 0 };
+            }
+        }
+
+        // 图片压缩工具
+        class ImageCompressor {
+            static async compress(file, maxWidth = 1920, maxHeight = 1920, quality = 0.8) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const img = new Image();
+                        img.onload = () => {
+                            let width = img.width;
+                            let height = img.height;
+
+                            // 计算缩放比例
+                            if (width > height) {
+                                if (width > maxWidth) {
+                                    height = height * (maxWidth / width);
+                                    width = maxWidth;
+                                }
+                            } else {
+                                if (height > maxHeight) {
+                                    width = width * (maxHeight / height);
+                                    height = maxHeight;
+                                }
+                            }
+
+                            // 创建 canvas 进行压缩
+                            const canvas = document.createElement('canvas');
+                            canvas.width = width;
+                            canvas.height = height;
+                            const ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0, width, height);
+
+                            // 转换为 base64
+                            const compressed = canvas.toDataURL('image/jpeg', quality);
+                            resolve(compressed);
+                        };
+                        img.onerror = reject;
+                        img.src = e.target.result;
+                    };
+                    reader.onerror = reject;
+                    reader.readAsDataURL(file);
+                });
+            }
+        }
+
         const app = {
             currentPage: 'home',
             currentPath: { notes: [], gallery: [], lyrics: [] },
@@ -855,6 +979,7 @@
             currentShareData: null,
             homeEditMode: false,
             currentParentId: null,
+            db: new NotesDB(),
 
             data: {
                 notes: [],
@@ -864,21 +989,54 @@
                 settings: { userId: '', avatar: '', theme: 'blue', background: '' }
             },
 
-            init() {
-                this.loadData();
-                this.updateTime();
-                setInterval(() => this.updateTime(), 1000);
-                this.renderHomePage();
-                this.loadSettings();
+            async init() {
+                try {
+                    await this.db.init();
+                    await this.loadData();
+                    this.updateTime();
+                    setInterval(() => this.updateTime(), 1000);
+                    this.renderHomePage();
+                    await this.loadSettings();
+                    await this.updateStorageInfo();
+                } catch (error) {
+                    console.error('初始化失败:', error);
+                    alert('应用初始化失败，请刷新页面重试');
+                }
             },
 
-            loadData() {
-                const saved = localStorage.getItem('noteAppData');
-                if (saved) this.data = JSON.parse(saved);
+            async loadData() {
+                try {
+                    const saved = await this.db.getData('noteAppData');
+                    if (saved) this.data = saved;
+                } catch (error) {
+                    console.error('加载数据失败:', error);
+                }
             },
 
-            saveData() {
-                localStorage.setItem('noteAppData', JSON.stringify(this.data));
+            async saveData() {
+                try {
+                    await this.db.saveData('noteAppData', this.data);
+                    await this.updateStorageInfo();
+                } catch (error) {
+                    console.error('保存数据失败:', error);
+                    throw error;
+                }
+            },
+
+            async updateStorageInfo() {
+                try {
+                    const estimate = await this.db.estimateStorage();
+                    const usedMB = (estimate.usage / 1024 / 1024).toFixed(2);
+                    const quotaMB = (estimate.quota / 1024 / 1024).toFixed(2);
+                    const percentage = ((estimate.usage / estimate.quota) * 100).toFixed(1);
+                    
+                    const infoElement = document.getElementById('storageInfo');
+                    if (infoElement) {
+                        infoElement.textContent = `已使用: ${usedMB}MB / ${quotaMB}MB (${percentage}%)`;
+                    }
+                } catch (error) {
+                    console.error('获取存储信息失败:', error);
+                }
             },
 
             showToast(message) {
@@ -913,6 +1071,7 @@
                 if (page === 'gallery') this.renderGalleryList();
                 if (page === 'lyrics') this.renderLyricsList();
                 if (page === 'home') this.renderHomePage();
+                if (page === 'settings') this.updateStorageInfo();
             },
 
             renderHomePage() {
@@ -955,10 +1114,10 @@
                 });
             },
 
-            removeFromHome(index) {
+            async removeFromHome(index) {
                 if (confirm('确定要从主页移除吗？')) {
                     this.data.homeItems.splice(index, 1);
-                    this.saveData();
+                    await this.saveData();
                     this.renderHomePage();
                 }
             },
@@ -1013,7 +1172,7 @@
                 return items;
             },
 
-            createFolder(type) {
+            async createFolder(type) {
                 const title = prompt('请输入文件夹名称：');
                 if (!title) return;
                 const folder = {
@@ -1025,7 +1184,7 @@
                     children: []
                 };
                 this.getCurrentItems(type).push(folder);
-                this.saveData();
+                await this.saveData();
                 this.showToast('文件夹创建成功');
                 if (type === 'notes') this.renderNotesList();
                 else if (type === 'gallery') this.renderGalleryList();
@@ -1169,7 +1328,7 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            saveNote() {
+            async saveNote() {
                 const title = document.getElementById('noteTitle').value;
                 const content = document.getElementById('noteContent').value;
                 if (!title || !content) { alert('请填写标题和正文'); return; }
@@ -1196,7 +1355,7 @@
                         this.getCurrentItems('notes').push(note);
                     }
                 }
-                this.saveData();
+                await this.saveData();
                 this.closeModal();
                 this.showToast('保存成功');
                 this.renderNotesList();
@@ -1240,11 +1399,11 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            deleteNote(id) {
+            async deleteNote(id) {
                 if (!confirm('确定要删除这个笔记吗？')) return;
                 this.removeItemById(this.data.notes, id);
                 this.data.homeItems = this.data.homeItems.filter(h => h.id !== id);
-                this.saveData();
+                await this.saveData();
                 this.closeViewModal();
                 this.renderNotesList();
                 this.renderHomePage();
@@ -1288,8 +1447,8 @@
                 document.getElementById('modalTitle').textContent = '新建图片';
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="galleryTitle" placeholder="标题">
-                    <input type="file" id="galleryImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'galleryImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('galleryImageInput').click()">选择图片</button>
+                    <input type="file" id="galleryImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'galleryImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('galleryImageInput').click()">选择图片（自动压缩）</button>
                     <img id="galleryImagePreview" class="image-preview" style="display: none;">
                     <textarea class="editor-input" id="galleryDescription" rows="5" placeholder="图片介绍"></textarea>
                     <button class="btn" style="width: 100%;" onclick="app.saveGalleryItem()">保存</button>
@@ -1297,19 +1456,23 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            previewImage(input, previewId) {
+            async previewAndCompressImage(input, previewId) {
                 if (input.files && input.files[0]) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
+                    try {
+                        this.showToast('正在压缩图片...');
+                        const compressed = await ImageCompressor.compress(input.files[0]);
                         const preview = document.getElementById(previewId);
-                        preview.src = e.target.result;
+                        preview.src = compressed;
                         preview.style.display = 'block';
-                    };
-                    reader.readAsDataURL(input.files[0]);
+                        this.showToast('图片压缩完成');
+                    } catch (error) {
+                        console.error('图片压缩失败:', error);
+                        alert('图片处理失败，请重试');
+                    }
                 }
             },
 
-            saveGalleryItem() {
+            async saveGalleryItem() {
                 const title = document.getElementById('galleryTitle').value;
                 const description = document.getElementById('galleryDescription').value;
                 const preview = document.getElementById('galleryImagePreview');
@@ -1337,7 +1500,7 @@
                         this.getCurrentItems('gallery').push(item);
                     }
                 }
-                this.saveData();
+                await this.saveData();
                 this.closeModal();
                 this.showToast('保存成功');
                 this.renderGalleryList();
@@ -1369,8 +1532,8 @@
                 document.getElementById('modalTitle').textContent = '编辑图片';
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="galleryTitle" placeholder="标题" value="${item.title}">
-                    <input type="file" id="galleryImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'galleryImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('galleryImageInput').click()">更换图片</button>
+                    <input type="file" id="galleryImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'galleryImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('galleryImageInput').click()">更换图片（自动压缩）</button>
                     <img id="galleryImagePreview" class="image-preview" style="display: block;" src="${item.image}">
                     <textarea class="editor-input" id="galleryDescription" rows="5" placeholder="图片介绍">${item.description || ''}</textarea>
                     <button class="btn" style="width: 100%;" onclick="app.saveGalleryItem()">保存</button>
@@ -1378,11 +1541,11 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            deleteGalleryItem(id) {
+            async deleteGalleryItem(id) {
                 if (!confirm('确定要删除这个图片吗？')) return;
                 this.removeItemById(this.data.gallery, id);
                 this.data.homeItems = this.data.homeItems.filter(h => h.id !== id);
-                this.saveData();
+                await this.saveData();
                 this.closeViewModal();
                 this.renderGalleryList();
                 this.renderHomePage();
@@ -1393,15 +1556,15 @@
                 document.getElementById('modalTitle').textContent = '新建歌手';
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="artistName" placeholder="歌手名称">
-                    <input type="file" id="artistImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'artistImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('artistImageInput').click()">选择头像</button>
+                    <input type="file" id="artistImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'artistImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('artistImageInput').click()">选择头像（自动压缩）</button>
                     <img id="artistImagePreview" class="image-preview" style="display: none;">
                     <button class="btn" style="width: 100%;" onclick="app.saveArtist()">保存</button>
                 `;
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            saveArtist() {
+            async saveArtist() {
                 const name = document.getElementById('artistName').value;
                 const preview = document.getElementById('artistImagePreview');
                 const image = preview.style.display !== 'none' ? preview.src : null;
@@ -1422,7 +1585,7 @@
                     };
                     this.data.lyrics.push(artist);
                 }
-                this.saveData();
+                await this.saveData();
                 this.closeModal();
                 this.showToast('保存成功');
                 this.renderLyricsList();
@@ -1467,19 +1630,19 @@
                 document.getElementById('modalTitle').textContent = '编辑歌手';
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="artistName" placeholder="歌手名称" value="${artist.title}">
-                    <input type="file" id="artistImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'artistImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('artistImageInput').click()">更换头像</button>
+                    <input type="file" id="artistImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'artistImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('artistImageInput').click()">更换头像（自动压缩）</button>
                     <img id="artistImagePreview" class="image-preview" style="${artist.image ? `display: block;" src="${artist.image}` : 'display: none;'}">
                     <button class="btn" style="width: 100%;" onclick="app.saveArtist()">保存</button>
                 `;
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            deleteArtist(artistId) {
+            async deleteArtist(artistId) {
                 if (!confirm('确定要删除这个歌手及其所有专辑和歌曲吗？')) return;
                 this.removeItemById(this.data.lyrics, artistId);
                 this.data.homeItems = this.data.homeItems.filter(h => h.id !== artistId);
-                this.saveData();
+                await this.saveData();
                 this.closeViewModal();
                 this.renderLyricsList();
                 this.renderHomePage();
@@ -1493,15 +1656,15 @@
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="albumTitle" placeholder="专辑名称">
                     <input type="text" class="editor-input" id="albumDate" placeholder="发售日期">
-                    <input type="file" id="albumImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'albumImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('albumImageInput').click()">选择封面</button>
+                    <input type="file" id="albumImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'albumImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('albumImageInput').click()">选择封面（自动压缩）</button>
                     <img id="albumImagePreview" class="image-preview" style="display: none;">
                     <button class="btn" style="width: 100%;" onclick="app.saveAlbum()">保存</button>
                 `;
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            saveAlbum() {
+            async saveAlbum() {
                 const title = document.getElementById('albumTitle').value;
                 const releaseDate = document.getElementById('albumDate').value;
                 const preview = document.getElementById('albumImagePreview');
@@ -1528,7 +1691,7 @@
                     if (!artist.children) artist.children = [];
                     artist.children.push(album);
                 }
-                this.saveData();
+                await this.saveData();
                 this.closeModal();
                 this.showToast('保存成功');
                 this.viewArtistAlbums(artist);
@@ -1611,15 +1774,15 @@
                 document.getElementById('editorContent').innerHTML = `
                     <input type="text" class="editor-input" id="albumTitle" placeholder="专辑名称" value="${album.title}">
                     <input type="text" class="editor-input" id="albumDate" placeholder="发售日期" value="${album.releaseDate || ''}">
-                    <input type="file" id="albumImageInput" class="file-input" accept="image/*" onchange="app.previewImage(this, 'albumImagePreview')">
-                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('albumImageInput').click()">更换封面</button>
+                    <input type="file" id="albumImageInput" class="file-input" accept="image/*" onchange="app.previewAndCompressImage(this, 'albumImagePreview')">
+                    <button class="btn" style="width: 100%; margin-bottom: 10px;" onclick="document.getElementById('albumImageInput').click()">更换封面（自动压缩）</button>
                     <img id="albumImagePreview" class="image-preview" style="${album.image ? `display: block;" src="${album.image}` : 'display: none;'}">
                     <button class="btn" style="width: 100%;" onclick="app.saveAlbum()">保存</button>
                 `;
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            deleteAlbum(albumId) {
+            async deleteAlbum(albumId) {
                 if (!confirm('确定要删除这个专辑及其所有歌曲吗？')) return;
                 for (let artist of this.data.lyrics) {
                     if (artist.children) {
@@ -1631,7 +1794,7 @@
                     }
                 }
                 this.data.homeItems = this.data.homeItems.filter(h => h.id !== albumId);
-                this.saveData();
+                await this.saveData();
                 this.closeViewModal();
                 this.renderLyricsList();
                 this.renderHomePage();
@@ -1654,7 +1817,7 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            saveSong() {
+            async saveSong() {
                 const title = document.getElementById('songTitle').value;
                 const lyricist = document.getElementById('songLyricist').value;
                 const composer = document.getElementById('songComposer').value;
@@ -1691,7 +1854,7 @@
                     if (!album.children) album.children = [];
                     album.children.push(song);
                 }
-                this.saveData();
+                await this.saveData();
                 this.closeModal();
                 this.showToast('保存成功');
                 this.viewAlbumSongs(album);
@@ -1785,7 +1948,7 @@
                 document.getElementById('editorModal').classList.add('active');
             },
 
-            deleteSong(songId) {
+            async deleteSong(songId) {
                 if (!confirm('确定要删除这首歌词吗？')) return;
                 for (let artist of this.data.lyrics) {
                     if (artist.children) {
@@ -1801,7 +1964,7 @@
                     }
                 }
                 this.data.homeItems = this.data.homeItems.filter(h => h.id !== songId);
-                this.saveData();
+                await this.saveData();
                 this.closeViewModal();
                 this.renderLyricsList();
                 this.renderHomePage();
@@ -1825,15 +1988,18 @@
                 display.textContent = type === 'lyrics' ? (song.lyrics || '无歌词') : (song.translation || '无翻译');
             },
 
-            addToHome(type, id) {
-                if (this.data.homeItems.some(item => item.id === id)) return;
+            async addToHome(type, id) {
+                if (this.data.homeItems.some(item => item.id === id)) {
+                    this.showToast('该项已在主页');
+                    return;
+                }
                 let item = null;
                 if (type === 'notes') item = this.findItemById(this.data.notes, id);
                 else if (type === 'gallery') item = this.findItemById(this.data.gallery, id);
                 else if (type === 'lyrics') item = this.findItemById(this.data.lyrics, id);
                 if (!item) return;
                 this.data.homeItems.push({ id: item.id, type, title: item.title, icon: item.icon, image: item.image });
-                this.saveData();
+                await this.saveData();
                 this.renderHomePage();
                 this.showToast('已添加到主页');
             },
@@ -1850,13 +2016,13 @@
                 });
             },
 
-            sortItems(type, order) {
+            async sortItems(type, order) {
                 const items = this.getCurrentItems(type);
                 if (order === 'alpha') items.sort((a, b) => a.title.localeCompare(b.title));
                 else if (order === 'alpha-reverse') items.sort((a, b) => b.title.localeCompare(a.title));
                 else if (order === 'time') items.sort((a, b) => new Date(a.date) - new Date(b.date));
                 else if (order === 'time-reverse') items.sort((a, b) => new Date(b.date) - new Date(a.date));
-                this.saveData();
+                await this.saveData();
                 if (type === 'notes') this.renderNotesList();
                 else if (type === 'gallery') this.renderGalleryList();
                 else if (type === 'lyrics') this.renderLyricsList();
@@ -1874,7 +2040,6 @@
                     shareText = `【笔记】${data.title}\n\n${data.content}`;
                 } else if (this.currentShareData.type === 'gallery') {
                     shareText = `【图片】${data.title}\n\n${data.description || ''}`;
-                    // For images, try to download
                     const link = document.createElement('a');
                     link.href = data.image;
                     link.download = `${data.title}.png`;
@@ -1913,52 +2078,59 @@
                 document.body.removeChild(textarea);
             },
 
-            changeTheme(theme) {
+            async changeTheme(theme) {
                 document.body.setAttribute('data-theme', theme);
                 this.data.settings.theme = theme;
-                this.saveData();
+                await this.saveData();
                 document.querySelectorAll('.theme-btn').forEach(btn => btn.classList.remove('active'));
                 event.target.classList.add('active');
             },
 
-            uploadAvatar(input) {
+            async uploadAvatar(input) {
                 if (input.files && input.files[0]) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        this.data.settings.avatar = e.target.result;
-                        document.getElementById('avatarDisplay').innerHTML = `<img src="${e.target.result}">`;
-                        this.saveData();
-                    };
-                    reader.readAsDataURL(input.files[0]);
+                    try {
+                        this.showToast('正在压缩头像...');
+                        const compressed = await ImageCompressor.compress(input.files[0], 400, 400, 0.9);
+                        this.data.settings.avatar = compressed;
+                        document.getElementById('avatarDisplay').innerHTML = `<img src="${compressed}">`;
+                        await this.saveData();
+                        this.showToast('头像已更新');
+                    } catch (error) {
+                        console.error('头像上传失败:', error);
+                        alert('头像上传失败');
+                    }
                 }
             },
 
-            saveUserId() {
+            async saveUserId() {
                 this.data.settings.userId = document.getElementById('userIdInput').value;
-                this.saveData();
+                await this.saveData();
                 this.showToast('ID已保存');
             },
 
-            setBackgroundUrl() {
+            async setBackgroundUrl() {
                 const url = document.getElementById('bgUrlInput').value;
                 if (url) {
                     document.body.style.backgroundImage = `url(${url})`;
                     this.data.settings.background = url;
-                    this.saveData();
+                    await this.saveData();
                     this.showToast('壁纸设置成功');
                 }
             },
 
-            uploadBackground(input) {
+            async uploadBackground(input) {
                 if (input.files && input.files[0]) {
-                    const reader = new FileReader();
-                    reader.onload = (e) => {
-                        document.body.style.backgroundImage = `url(${e.target.result})`;
-                        this.data.settings.background = e.target.result;
-                        this.saveData();
+                    try {
+                        this.showToast('正在压缩壁纸...');
+                        const compressed = await ImageCompressor.compress(input.files[0], 1920, 1920, 0.85);
+                        document.body.style.backgroundImage = `url(${compressed})`;
+                        this.data.settings.background = compressed;
+                        await this.saveData();
                         this.showToast('壁纸设置成功');
-                    };
-                    reader.readAsDataURL(input.files[0]);
+                    } catch (error) {
+                        console.error('壁纸上传失败:', error);
+                        alert('壁纸上传失败');
+                    }
                 }
             },
 
@@ -2016,10 +2188,10 @@
                 URL.revokeObjectURL(url);
             },
 
-            importData(input) {
+            async importData(input) {
                 if (input.files && input.files[0]) {
                     const reader = new FileReader();
-                    reader.onload = (e) => {
+                    reader.onload = async (e) => {
                         try {
                             const imported = JSON.parse(e.target.result);
                             if (confirm('是否合并导入的数据？（取消将覆盖现有数据）')) {
@@ -2031,7 +2203,7 @@
                                 if (imported.gallery) this.data.gallery = imported.gallery;
                                 if (imported.lyrics) this.data.lyrics = imported.lyrics;
                             }
-                            this.saveData();
+                            await this.saveData();
                             this.showToast('导入成功');
                             this.renderNotesList();
                             this.renderGalleryList();
@@ -2045,7 +2217,7 @@
                 }
             },
 
-            loadSettings() {
+            async loadSettings() {
                 const settings = this.data.settings;
                 if (settings.theme) document.body.setAttribute('data-theme', settings.theme);
                 if (settings.background) document.body.style.backgroundImage = `url(${settings.background})`;
@@ -2053,49 +2225,51 @@
                 if (settings.userId) document.getElementById('userIdInput').value = settings.userId;
             },
 
-            // 手动保存所有数据
-            manualSave() {
+            async manualSave() {
                 try {
-                    this.saveData();
-                    const dataSize = new Blob([JSON.stringify(this.data)]).size;
-                    const sizeKB = (dataSize / 1024).toFixed(2);
-                    this.showToast(`保存成功！数据大小: ${sizeKB}KB`);
+                    await this.saveData();
+                    await this.updateStorageInfo();
+                    this.showToast('保存成功！');
                 } catch (error) {
                     alert('保存失败：' + error.message);
                 }
             },
 
-            // 清除所有数据
-            clearAllData() {
+            async clearAllData() {
                 if (!confirm('⚠️ 警告：此操作将清除所有数据（包括笔记、图片、歌词、主页设置、壁纸等）！\n\n确定要继续吗？')) return;
                 if (!confirm('最后确认：真的要清除所有数据吗？此操作不可恢复！')) return;
                 
-                // 清空所有数据
-                this.data = {
-                    notes: [],
-                    gallery: [],
-                    lyrics: [],
-                    homeItems: [],
-                    settings: { userId: '', avatar: '', theme: 'blue', background: '' }
-                };
-                
-                // 清除localStorage
-                localStorage.removeItem('noteAppData');
-                
-                // 重置界面
-                document.body.setAttribute('data-theme', 'blue');
-                document.body.style.backgroundImage = '';
-                document.getElementById('avatarDisplay').innerHTML = '👤';
-                document.getElementById('userIdInput').value = '';
-                document.getElementById('bgUrlInput').value = '';
-                
-                // 刷新所有列表
-                this.renderHomePage();
-                this.renderNotesList();
-                this.renderGalleryList();
-                this.renderLyricsList();
-                
-                this.showToast('所有数据已清除');
+                try {
+                    // 清空所有数据
+                    this.data = {
+                        notes: [],
+                        gallery: [],
+                        lyrics: [],
+                        homeItems: [],
+                        settings: { userId: '', avatar: '', theme: 'blue', background: '' }
+                    };
+                    
+                    // 清除IndexedDB
+                    await this.db.clearAll();
+                    
+                    // 重置界面
+                    document.body.setAttribute('data-theme', 'blue');
+                    document.body.style.backgroundImage = '';
+                    document.getElementById('avatarDisplay').innerHTML = '👤';
+                    document.getElementById('userIdInput').value = '';
+                    document.getElementById('bgUrlInput').value = '';
+                    
+                    // 刷新所有列表
+                    this.renderHomePage();
+                    this.renderNotesList();
+                    this.renderGalleryList();
+                    this.renderLyricsList();
+                    await this.updateStorageInfo();
+                    
+                    this.showToast('所有数据已清除');
+                } catch (error) {
+                    alert('清除数据失败：' + error.message);
+                }
             },
 
             closeModal() {
